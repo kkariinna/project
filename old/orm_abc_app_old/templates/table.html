@@ -1,0 +1,60 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_abc_app:table{% endblock %}
+
+
+{% block content %}
+
+    <div class="card">
+        <div class="card-body">
+            {% include "navigation.html" %}
+        </div>
+    </div>
+
+    <h5>orm_abc_app:table</h5>
+
+    {#    <table class="table table-bordered">#}
+    {#        <tbody style="border-top: 3.0px;">#}
+    {#        {% for one_row in row %}#}
+    {#            <tr>#}
+    {#                {% for k, v in one_row.items %}#}
+    {#                    <td>#}
+    {#                        {{ v }}#}
+    {#                    </td>#}
+    {#                {% endfor %}#}
+    {#            </tr>#}
+    {#        {% endfor %}#}
+    {#        <tbody>#}
+    {#    </table>#}
+
+    <table class="table table-bordered">
+        <tbody style="border-top: 3.0px;">
+        <tr>
+            {% for name in field_names %}
+                <td>{{ name }}</td>
+            {% endfor %}
+        </tr>
+        {% for row in row_lists %}
+            <tr>
+                {% for item in row %}
+                    <td>
+                        {{ item }}
+                    </td>
+                {% endfor %}
+            </tr>
+        {% endfor %}
+        <tbody>
+    </table>
+
+    <p>Статистика</p>
+    {#    {% autoescape off %}{{ statics.statics_val }}{% endautoescape %}#}
+    {% for item in statics.statics_val %}
+        {% for k, v in  item.items %}
+            {{ k }}:  {{ v }};
+            {#            {% autoescape off %}{{ k }}:  {{ v }}; {% endautoescape %}#}
+        {% endfor %}
+    {% endfor %}
+
+
+{% endblock %}
+

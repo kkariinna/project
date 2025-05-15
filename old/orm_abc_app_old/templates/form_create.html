@@ -1,0 +1,49 @@
+{% extends 'layout.html' %}
+
+{% block title %} form_abc_app:form_create {% endblock %}
+
+{% block content %}
+    <h5>orm_abc_app:form_create</h5>
+    {% load widget_tweaks %}
+    <form {% url 'orm_abc_app:form_create' %} method="POST">
+        {% csrf_token %}
+        <div class="form-group mb-1">
+            <div class="mb-1 row">
+                <label class="col-sm-2 col-form-label">Формулировка</label>
+                <div class="col-sm-10">
+                    {% render_field form.task class="form-control" %}
+                </div>
+            </div>
+
+            <div class="mb-1 row">
+                <label class="col-sm-2 col-form-label">A</label>
+                <div class="col-sm-10">
+                    {% render_field form.a class="form-control" %}
+                </div>
+            </div>
+
+            <div class="mb-1 row">
+                <label class="col-sm-2 col-form-label">B</label>
+                <div class="col-sm-10">
+                    {% render_field form.b class="form-control" %}
+                </div>
+            </div>
+
+            <div class="mb-1 row">
+                <label class="col-sm-2 col-form-label">C</label>
+                <div class="col-sm-10">
+                    {% render_field form.c class="form-control" %}
+                </div>
+            </div>
+
+
+            <div class="mb-1 row">
+                <label class="col-sm-8 col-form-label"></label>
+                <div class="col-sm-4 text-end">
+                    <button type="submit" class="form-control">Отправить</button>
+                </div>
+            </div>
+        </div>
+
+    </form>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends 'layout.html' %}
+
+{% block title %} form_abc_app/abc_form {% endblock %}
+
+{% block content %}
+    <h5>orm_abc_app:abc_form</h5>
+{#    <form action="/abc_get" metod='get' target="_self">#}
+    <form action="{% url 'orm_abc_app:abc_get' %}" metod='get' target="_self">
+        {{ abc_form }}
+        <label for="id_submit">&nbsp;</label>
+        <button type="submit" id="id_submit">Отправить</button>
+        </label>
+    </form>
+{% endblock %}
