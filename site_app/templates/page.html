@@ -1,0 +1,27 @@
+{% extends 'layout.html' %}
+
+{% block title %}<title>{{ content_object.item_title }}</title>{% endblock %}
+
+{% block content %}
+    <div class="card">
+
+        <div class="card-body">
+            <ul class="nav nav-tabs">
+                {% for object in nav_objects %}
+{#                    {{ pk }}: {{ object.id }}: {{ object.item_nav }}#}
+                    <li class="nav-item">
+                        <a style="color:black; text-decoration:none" class="{% if pk == object.id %}nav-link active{% else %}nav-link{% endif %}"
+                           href="{% url 'site_app:page' pk=object.id %}">{{ object.item_nav }}</a>
+                    </li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <div class="card-body">
+            <h5 class='card-title text-center'> {% autoescape off %}{{ content_object.item_title }}{% endautoescape %}</h5>
+            {% autoescape off %}{{ content_object.item_content }}{% endautoescape %}
+{#            <ul>{% for k, v in content_object.items %}<li>{% autoescape off %}{{ k }}: {{ v }}{% endautoescape %}</li>{% endfor %}</ul>#}
+        </div>
+
+    </div>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_abc_app:result{% endblock %}
+
+{% block content %}
+    <h5>orm_abc_app:result</h5>
+    <h6>
+        {% for item in task_main %}
+            {{ item }}
+        {% endfor %}
+    </h6>
+    <table class="table table-bordered">
+        <thead>
+        <tr>
+            <th scope="col">A</th>
+            <th scope="col">B</th>
+            <th scope="col">C</th>
+            <th scope="col">Результат</th>
+        </tr>
+        </thead>
+        <tbody style="border-top: 0px;">
+        <tr>
+            {% for item in last_data %}
+                <td>
+                    {{ item }}
+                </td>
+            {% endfor %}
+        </tr>
+        </tbody>
+    </table>
+{% endblock %}

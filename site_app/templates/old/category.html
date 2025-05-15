@@ -1,0 +1,14 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_abc_app:list{% endblock %}
+
+{% block content %}
+    <h5>contant_main_list_dict</h5>
+    <p>category
+{#        <br>{{ object_list }}#}
+        {% for object in objects_list %}
+            <br>{{ object.id }}: {{ object.name }}
+            <li><a href="{%  url 'orm_store_app:table' pk=object.id %}">{{ object.name }}</a></li>
+        {% endfor %}
+    </p>
+{% endblock %}

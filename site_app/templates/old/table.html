@@ -1,0 +1,22 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_store_table:table{% endblock %}
+
+
+{% block content %}
+    <h5>orm_store_table</h5>
+    <table class="table table-bordered">
+        <tbody style="border-top: 3.0px;">
+        {% for row in rows %}
+            <tr>
+                {% for item in row %}
+                    <td>
+                        {{ item }}
+                    </td>
+                {% endfor %}
+
+            </tr>
+        {% endfor %}
+        <tbody>
+    </table>
+{% endblock %}

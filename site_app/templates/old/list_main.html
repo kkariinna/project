@@ -1,0 +1,23 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_abc_app:list{% endblock %}
+
+
+{% block content %}
+    <h5>contant_main_list_dict</h5>
+    <p>list_main
+        <br>{{ list_main }}
+        <br>{{ list_main.2}}
+        {% for value in list_main %}
+            <br>{{ value }}
+        {% endfor %}
+    </p>
+    <p>dict_main
+        <br>{{ dict_main }}
+        <br>{{ dict_main.x }}
+        <br>{{ dict_main.y }}
+        {% for key, value in dict_main.items %}
+            <br>{{ key }}: {{ value }}
+        {% endfor %}
+    </p>
+{% endblock %}

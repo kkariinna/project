@@ -1,0 +1,31 @@
+{% extends 'layout.html' %}
+
+{% block title %}orm_store_page{% endblock %}
+
+{% block content %}
+    <h6>Category</h6>
+    <p>category_context.category: {{ category_context.category }}</p>
+    <ul>
+        {% for object in category_context.category %}
+            <li>{{ object.id }}: {{ object.name }}
+                <a href="{% url 'orm_store_app:page' pk=object.id %}">{{ object.name }}</a>
+            </li>
+        {% endfor %}
+    </ul>
+
+    {% load static %}
+    <h6>Table</h6>
+    <p>items_context.items: {{ items_context.items }}</p>
+    <table class="table table-bordered">
+        <tbody style="border-top: 3.0px;">
+        {% for item in items_context.items %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.description }}</td>
+                <td><img src="{% static item.image %}" width="200px>"></td>
+            </tr>
+        {% endfor %}
+        <tbody>
+    </table>
+
+{% endblock %}
