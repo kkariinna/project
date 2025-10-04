@@ -1,0 +1,593 @@
+import os
+import sys
+import argparse
+import random
+import joblib
+from joblib import dump, load
+import yaml
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, brier_score_loss
+import lightgbm as lgb
+from tqdm import tqdm
+from collections import deque
+
+# ---------------------------
+# Config (embedded defaults)
+# ---------------------------
+DEFAULT_CONFIG = {
+    'seed': 42,
+    'data': {
+        'candles': 'data/task_1_candles.csv',
+        'news':   'data/task_1_news.csv'
+    },
+    'output': {
+        'artifacts_dir': 'artifacts',
+        'predictions_dir': 'output'
+    },
+    'features': {
+        'price_rolling_windows': [3, 5, 10, 20],
+        'lag_returns': 20,
+        'news_tfidf_max_features': 5000,
+        'news_agg_windows_days': [1, 3, 7]
+    },
+    'model': {
+        'lgbm': {
+            'params': {
+                'num_leaves': 31,
+                'learning_rate': 0.05,
+                'n_estimators': 1000,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8
+            },
+            'early_stopping_rounds': 50
+        }
+    },
+    'train': {
+        'test_fraction': 0.2,
+        'validation_fraction': 0.1
+    }
+}
+
+# Minimal deterministic polarity lists (extendable)
+POS_WORDS = {"gain","up","positive","beat","beats","buy","upgrade","benefit","profit","growth","surge","strong","beat"}
+NEG_WORDS = {"loss","down","negative","miss","missed","sell","downgrade","decline","fall","weak","drop","cut"}
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    # lightgbm uses numpy/random; set param random_state in models as well
+
+def ensure_dirs(*paths):
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
+
+def read_config_from_yaml(path):
+    if not path:
+        return DEFAULT_CONFIG
+    if not os.path.exists(path):
+        print(f"Config file {path} not found. Using defaults.")
+        return DEFAULT_CONFIG
+    return yaml.safe_load(open(path, 'r'))
+# ---------------------------
+# Data ingest
+# ---------------------------
+def load_candles(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Candles file not found: {path}")
+    df = pd.read_csv(path)
+    if 'date' not in df.columns:
+        raise ValueError("Candles CSV must contain 'date' column")
+    if 'close' not in df.columns:
+        raise ValueError("Candles CSV must contain 'close' column")
+    if 'ticker' not in df.columns:
+        raise ValueError("Candles CSV must contain 'ticker' column")
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    df = df.sort_values(['ticker','date']).reset_index(drop=True)
+    # forward fill missing required columns if any
+    # compute prev close and returns for internal featurization
+    df['close_prev'] = df.groupby('ticker')['close'].shift(1)
+    df['ret'] = df['close'] / df['close_prev'] - 1.0
+    return df
+
+def load_news(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"News file not found: {path}")
+    df = pd.read_csv(path)
+    if 'date' not in df.columns:
+        raise ValueError("News CSV must contain 'date' column")
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    # create content column
+    if 'content' not in df.columns and 'title' not in df.columns:
+        raise ValueError("News CSV must contain at least 'title' or 'content'")
+    if 'content' not in df.columns:
+        df['content'] = df['title'].astype(str)
+    else:
+        df['content'] = df.get('title', '').fillna('') + '. ' + df['content'].fillna('')
+    df = df.sort_values('date').reset_index(drop=True)
+    return df
+
+# ---------------------------
+# Simple deterministic sentiment
+# ---------------------------
+def simple_sentiment(text):
+    text = str(text).lower()
+    tokens = [t.strip('.,!?:;()[]') for t in text.split()]
+    pos = sum(1 for t in tokens if t in POS_WORDS)
+    neg = sum(1 for t in tokens if t in NEG_WORDS)
+    if (pos + neg) == 0:
+        return 0.0
+    return (pos - neg) / (pos + neg)
+
+# ---------------------------
+# Feature engineering
+# ---------------------------
+def compute_price_features(candles_df, cfg):
+    cfg_features = cfg['features']
+    windows = cfg_features['price_rolling_windows']
+    L = cfg_features['lag_returns']
+    df = candles_df.copy().sort_values(['ticker','date']).reset_index(drop=True)
+    # ensure close_prev and ret available
+    if 'close_prev' not in df.columns:
+        df['close_prev'] = df.groupby('ticker')['close'].shift(1)
+    df['ret'] = df['close'] / df['close_prev'] - 1.0
+    # rolling
+    for w in windows:
+        df[f'sma_close_{w}'] = df.groupby('ticker')['close'].transform(lambda x: x.rolling(w, min_periods=1).mean())
+        df[f'vol_{w}'] = df.groupby('ticker')['ret'].transform(lambda x: x.rolling(w, min_periods=1).std().fillna(0.0))
+        df[f'ret_sum_{w}'] = df.groupby('ticker')['ret'].transform(lambda x: x.rolling(w, min_periods=1).sum().fillna(0.0))
+    for lag in range(1, L+1):
+        df[f'ret_lag_{lag}'] = df.groupby('ticker')['ret'].shift(lag)
+    df['close_minus_sma20'] = (df['close'] - df[f'sma_close_{max(windows)}']) / (df[f'sma_close_{max(windows)}'] + 1e-12)
+    # normalized volume
+    if 'volume' in df.columns:
+        df['vol_z_20'] = df.groupby('ticker')['volume'].transform(lambda x: (x - x.rolling(20, min_periods=1).mean()) / (x.rolling(20, min_periods=1).std().replace(0,1)))
+    else:
+        df['vol_z_20'] = 0.0
+    return df
+> Настя:
+
+
+def aggregate_news_features(news_df, cfg, artifacts_dir):
+    # compute sentiment and TF-IDF; aggregate per (ticker,date)
+    cfg_features = cfg['features']
+    news = news_df.copy()
+    news['text'] = news['content'].fillna('').astype(str)
+    news['sentiment'] = news['text'].map(simple_sentiment)
+    # TF-IDF vectorizer (deterministic)
+    tfidf_path = os.path.join(artifacts_dir, "tfidf_vectorizer.joblib")
+    vect = None
+    if os.path.exists(tfidf_path):
+        vect = load(tfidf_path)
+    else:
+        vect = TfidfVectorizer(max_features=cfg_features['news_tfidf_max_features'], stop_words='english')
+        try:
+            vect.fit(news['text'].values)
+            dump(vect, tfidf_path)
+        except Exception:
+            vect = None  # fallback
+    # prepare doc_index for mapping into tfidf matrix
+    news = news.reset_index(drop=False).rename(columns={'index': 'doc_index'})
+    res = []
+    windows = cfg_features['news_agg_windows_days']
+    # group by ticker (NaN allowed)
+    for ticker, sub in tqdm(news.groupby('ticker'), desc="agg_news"):
+        sub = sub.sort_values('date').reset_index(drop=True)
+        dates = sub['date'].unique()
+        for d in dates:
+            row = {'ticker': ticker, 'date': d}
+            past = sub[sub['date'] <= d]
+            for w in windows:
+                start = d - pd.Timedelta(days=w-1)
+                sel = past[(past['date'] >= start) & (past['date'] <= d)]
+                cnt = len(sel)
+                row[f'news_count_{w}d'] = cnt
+                row[f'news_sentiment_mean_{w}d'] = sel['sentiment'].mean() if cnt>0 else 0.0
+                row[f'news_avg_len_{w}d'] = sel['text'].str.len().mean() if cnt>0 else 0.0
+            # aggregated tfidf summary stats
+            if vect is not None:
+                try:
+                    sel_idx = past['doc_index'].values
+                    if len(sel_idx) > 0:
+                        Xsel = vect.transform(past['text'].values)
+                        mean_vec = Xsel.mean(axis=0)
+                        mean_vec = np.asarray(mean_vec).reshape(-1)
+                        row['news_tfidf_mean_sum'] = float(mean_vec.sum())
+                        row['news_tfidf_mean_max'] = float(mean_vec.max())
+                        row['news_tfidf_mean_std'] = float(mean_vec.std())
+                    else:
+                        row['news_tfidf_mean_sum'] = 0.0
+                        row['news_tfidf_mean_max'] = 0.0
+                        row['news_tfidf_mean_std'] = 0.0
+                except Exception:
+                    row['news_tfidf_mean_sum'] = 0.0
+                    row['news_tfidf_mean_max'] = 0.0
+                    row['news_tfidf_mean_std'] = 0.0
+            else:
+                row['news_tfidf_mean_sum'] = 0.0
+                row['news_tfidf_mean_max'] = 0.0
+                row['news_tfidf_mean_std'] = 0.0
+            res.append(row)
+    agg_df = pd.DataFrame(res).fillna(0.0)
+    return agg_df, vect
+
+def merge_price_news(price_df, news_agg_df):
+    merged = price_df.merge(news_agg_df, how='left', left_on=['ticker','date'], right_on=['ticker','date'])
+    # fill missing news aggregates with zeros
+    news_cols = [c for c in merged.columns if c.startswith('news_') or c.startswith('news')]
+    for c in news_cols:
+        merged[c] = merged[c].fillna(0.0)
+    return merged
+
+> Настя:
+
+
+def build_feature_matrix(merged_df, cfg, artifacts_dir):
+    df = merged_df.copy().sort_values(['ticker','date']).reset_index(drop=True)
+    df['ret_next'] = df.groupby('ticker')['ret'].shift(-1)
+    df['label_up_next'] = (df['ret_next'] > 0).astype(int)
+    df = df[~df['ret_next'].isna()].reset_index(drop=True)
+    exclude = {'date','ticker','ret_next','label_up_next','content','text','sentiment','close_prev','r'}
+    feature_cols = [c for c in df.columns if c not in exclude]
+    X = df[feature_cols].fillna(0.0)
+    scaler_path = os.path.join(artifacts_dir, "scaler.joblib")
+    if os.path.exists(scaler_path):
+        scaler = load(scaler_path)
+    else:
+        scaler = StandardScaler()
+        scaler.fit(X)
+        dump(scaler, scaler_path)
+    Xs = scaler.transform(X)
+    Xs_df = pd.DataFrame(Xs, columns=feature_cols, index=df.index)
+    Xs_df['ret_next'] = df['ret_next'].values
+    Xs_df['label_up_next'] = df['label_up_next'].values
+    Xs_df['date'] = df['date'].values
+    Xs_df['ticker'] = df['ticker'].values
+    return Xs_df, feature_cols, scaler
+
+# ---------------------------
+# Helpers for recursive forecasting
+# ---------------------------
+def get_last_state_per_ticker(candles, cfg, cutoff_date):
+    max_window = max(cfg['features']['price_rolling_windows'])
+    max_lag = cfg['features']['lag_returns']
+    needed = max(max_window + 5, max_lag + 5)
+    df = candles.copy()
+    df['date'] = pd.to_datetime(df['date']).dt.normalize()
+    df = df[df['date'] <= pd.to_datetime(cutoff_date).normalize()]
+    states = {}
+    for ticker, sub in df.groupby('ticker'):
+        sub = sub.sort_values('date').reset_index(drop=True)
+        closes = sub['close'].tolist()
+        rets = sub['ret'].tolist() if 'ret' in sub.columns else []
+        vols = sub['volume'].tolist() if 'volume' in sub.columns else [0.0]*len(closes)
+        last_closes = deque(closes[-needed:], maxlen=needed)
+        last_rets = deque(rets[-needed:], maxlen=needed)
+        last_vols = deque(vols[-needed:], maxlen=needed)
+        states[ticker] = {'closes': last_closes, 'rets': last_rets, 'vols': last_vols, 'last_close': last_closes[-1] if len(last_closes)>0 else np.nan}
+    return states
+def state_to_feature_vector(state, news_row, feature_cols, cfg):
+    # compute precomps
+    pre = {}
+    rets = list(state['rets'])
+    closes = list(state['closes'])
+    vols = list(state['vols'])
+    # lags
+    L = cfg['features']['lag_returns']
+    for lag in range(1, L+1):
+        pre[f'ret_lag_{lag}'] = float(rets[-lag]) if len(rets) >= lag else 0.0
+    # windows
+    for w in cfg['features']['price_rolling_windows']:
+        arr_cl = np.array(closes[-w:]) if len(closes) >= 1 else np.array([0.0])
+        arr_rt = np.array(rets[-w:]) if len(rets) >= 1 else np.array([0.0])
+        pre[f'sma_close_{w}'] = float(np.mean(arr_cl)) if arr_cl.size>0 else 0.0
+        pre[f'vol_{w}'] = float(np.std(arr_rt)) if arr_rt.size>0 else 0.0
+        pre[f'ret_sum_{w}'] = float(np.sum(arr_rt)) if arr_rt.size>0 else 0.0
+    last_close = float(state['last_close']) if not np.isnan(state['last_close']) else 0.0
+    pre['close_minus_sma20'] = (last_close - pre.get(f'sma_close_{max(cfg["features"]["price_rolling_windows"])}', 0.0)) / (pre.get(f'sma_close_{max(cfg["features"]["price_rolling_windows"])}',0.0) + 1e-12)
+    # vol_z_20
+    if len(vols) > 0:
+        arrv = np.array(vols[-20:]) if len(vols) >= 1 else np.array([0.0])
+        meanv = float(arrv.mean()) if arrv.size>0 else 0.0
+        stdv = float(arrv.std()) if arrv.size>0 else 1.0
+        if stdv == 0: stdv = 1.0
+        pre['vol_z_20'] = (vols[-1] - meanv) / stdv if len(vols)>0 else 0.0
+    else:
+        pre['vol_z_20'] = 0.0
+    # news features
+    news_dict = {}
+    if news_row is not None:
+        for c in news_row.index:
+            news_dict[c] = float(news_row[c])
+    # build feature vector in order
+    vec = []
+    for col in feature_cols:
+        if col in pre:
+            vec.append(pre[col])
+        elif col in news_dict:
+            vec.append(news_dict[col])
+        elif col in ['close','volume','last_close']:
+            if col == 'close' or col == 'last_close':
+                vec.append(last_close)
+            else:
+                vec.append(float(vols[-1]) if len(vols)>0 else 0.0)
+        else:
+            vec.append(0.0)
+    return np.asarray(vec, dtype=float)
+
+def update_state_with_predicted_return(state, pred_ret):
+    # pred_ret is arithmetic return: close_next = close * (1 + pred_ret)
+    last = state['last_close']
+    new_close = last * (1.0 + float(pred_ret))
+    state['closes'].append(new_close)
+    state['rets'].append(pred_ret)
+    if len(state['vols']) > 0:
+        state['vols'].append(state['vols'][-1])
+    else:
+        state['vols'].append(0.0)
+    state['last_close'] = new_close
+    return state
+# ---------------------------
+# Training
+# ---------------------------
+def train_all(cfg):
+    set_seed(cfg['seed'])
+    ensure_dirs(cfg['output']['artifacts_dir'], cfg['output']['predictions_dir'])
+    artifacts_dir = cfg['output']['artifacts_dir']
+    print("Loading data...")
+    candles = load_candles(cfg['data']['candles'])
+    news = load_news(cfg['data']['news'])
+    print("Computing price features...")
+    price_feats = compute_price_features(candles, cfg)
+    print("Aggregating news features...")
+    news_agg, vect = aggregate_news_features(news, cfg, artifacts_dir)
+    if vect is not None:
+        dump(vect, os.path.join(artifacts_dir, "tfidf_vectorizer.joblib"))
+    print("Merging...")
+    merged = merge_price_news(price_feats, news_agg)
+    print("Building feature matrix...")
+    Xdf, feature_cols, scaler = build_feature_matrix(merged, cfg, artifacts_dir)
+    print("Splitting by time (train/val/test)...")
+    Xdf = Xdf.sort_values('date').reset_index(drop=True)
+    n = len(Xdf)
+    test_size = int(n * cfg['train']['test_fraction'])
+    train_val = Xdf.iloc[:-test_size]
+    test = Xdf.iloc[-test_size:]
+    val_size = int(len(train_val) * cfg['train']['validation_fraction'])
+    train = train_val.iloc[:-val_size]
+    val = train_val.iloc[-val_size:]
+    print(f"Sizes: train={len(train)}, val={len(val)}, test={len(test)}")
+    feature_cols = list(feature_cols)
+    X_train = train[feature_cols].values
+    y_train_reg = train['ret_next'].values
+    y_train_clf = train['label_up_next'].values
+    X_val = val[feature_cols].values
+    y_val_reg = val['ret_next'].values
+    y_val_clf = val['label_up_next'].values
+    # Regressor
+    print("Training LightGBM regressor...")
+    params = cfg['model']['lgbm']['params'].copy()
+    params['objective'] = 'regression'
+    params['random_state'] = cfg['seed']
+    reg = lgb.LGBMRegressor(**params)
+    reg.fit(X_train, y_train_reg,
+            eval_set=[(X_val, y_val_reg)],
+            early_stopping_rounds=cfg['model']['lgbm']['early_stopping_rounds'],
+            verbose=50)
+    dump(reg, os.path.join(artifacts_dir, "lgbm_regressor.joblib"))
+    print("Regressor saved.")
+    # Classifier
+    print("Training LightGBM classifier...")
+    params_clf = cfg['model']['lgbm']['params'].copy()
+    params_clf['objective'] = 'binary'
+    params_clf['random_state'] = cfg['seed']
+    clf = lgb.LGBMClassifier(**params_clf)
+    clf.fit(X_train, y_train_clf,
+            eval_set=[(X_val, y_val_clf)],
+            early_stopping_rounds=cfg['model']['lgbm']['early_stopping_rounds'],
+            verbose=50)
+    dump(clf, os.path.join(artifacts_dir, "lgbm_classifier.joblib"))
+    print("Classifier saved.")
+    # Save artifacts
+    dump(feature_cols, os.path.join(artifacts_dir, "feature_columns.joblib"))
+    dump(scaler, os.path.join(artifacts_dir, "scaler.joblib"))
+    dump(cfg, os.path.join(artifacts_dir, "config_snapshot.joblib"))
+    print("Training complete, artifacts saved to", artifacts_dir)
+# ---------------------------
+# Prediction (non-recursive): predict next-day for rows that have next-day truth
+# ---------------------------
+def predict(cfg):
+    set_seed(cfg['seed'])
+    ensure_dirs(cfg['output']['predictions_dir'])
+    artifacts_dir = cfg['output']['artifacts_dir']
+    print("Loading artifacts...")
+    reg_path = os.path.join(artifacts_dir, "lgbm_regressor.joblib")
+    clf_path = os.path.join(artifacts_dir, "lgbm_classifier.joblib")
+    feat_path = os.path.join(artifacts_dir, "feature_columns.joblib")
+    scaler_path = os.path.join(artifacts_dir, "scaler.joblib")
+    if not os.path.exists(reg_path) or not os.path.exists(clf_path):
+        raise FileNotFoundError("Models not found. Run train first.")
+    reg = load(reg_path)
+    clf = load(clf_path)
+    feature_cols = load(feat_path)
+    scaler = load(scaler_path)
+    print("Loading data...")
+    candles = load_candles(cfg['data']['candles'])
+    news = load_news(cfg['data']['news'])
+    price_feats = compute_price_features(candles, cfg)
+    news_agg, vect = aggregate_news_features(news, cfg, artifacts_dir)
+    merged = merge_price_news(price_feats, news_agg)
+    Xdf, feature_cols_used, scaler = build_feature_matrix(merged, cfg, artifacts_dir)
+    feature_cols_used = feature_cols
+    X = Xdf[feature_cols_used].values
+    print("Predicting next-day returns and p(up)...")
+    yhat_reg = reg.predict(X)
+    yhat_p = clf.predict_proba(X)[:,1]
+    out = Xdf[['date','ticker']].copy().reset_index(drop=True)
+    out['r_hat_1'] = yhat_reg
+    out['p_up_1'] = yhat_p
+    out['R_hat_20'] = out['r_hat_1'] * 20.0  # placeholder
+    out = out.rename(columns={'date':'date_cutoff'})
+    out['date_cutoff'] = pd.to_datetime(out['date_cutoff']).dt.date.astype(str)
+    out['model_version'] = 'lgbm_v1'
+    preds_path = os.path.join(cfg['output']['predictions_dir'], f"predictions_all_nextday_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    out.to_csv(preds_path, index=False, float_format="%.8f")
+    print("Saved predictions to", preds_path)
+    return preds_path
+
+# ---------------------------
+# Recursive multi-day prediction
+# ---------------------------
+def predict_recursive(cfg, cutoff_date=None, horizon=20):
+    set_seed(cfg['seed'])
+    ensure_dirs(cfg['output']['predictions_dir'])
+    artifacts_dir = cfg['output']['artifacts_dir']
+    print("Loading artifacts...")
+    reg_path = os.path.join(artifacts_dir, "lgbm_regressor.joblib")
+    clf_path = os.path.join(artifacts_dir, "lgbm_classifier.joblib")
+    feat_path = os.path.join(artifacts_dir, "feature_columns.joblib")
+    scaler_path = os.path.join(artifacts_dir, "scaler.joblib")
+    if not os.path.exists(reg_path) or not os.path.exists(clf_path):
+        raise FileNotFoundError("Models not found. Run train first.")
+    reg = load(reg_path)
+    clf = load(clf_path)
+    feature_cols = load(feat_path)
+    scaler = load(scaler_path)
+    print("Loading data...")
+    candles = load_candles(cfg['data']['candles'])
+    news = load_news(cfg['data']['news'])
+    price_feats = compute_price_features(candles, cfg)
+    news_agg, vect = aggregate_news_features(news, cfg, artifacts_dir)
+    merged = merge_price_news(price_feats, news_agg)
+    Xdf, feature_cols_used, scaler = build_feature_matrix(merged, cfg, artifacts_dir)
+    # cutoff default: last available date
+    if cutoff_date is None:
+        cutoff = candles['date'].max()
+    else:
+        cutoff = pd.to_datetime(cutoff_date).normalize()
+    print("Building initial ticker states up to cutoff:", cutoff.date().isoformat())
+    states = get_last_state_per_ticker(candles, cfg, cutoff)
+    news_agg['date'] = pd.to_datetime(news_agg['date']).dt.normalize()
+    news_lookup = news_agg.set_index(['ticker','date']) if not news_agg.empty else pd.DataFrame()
+    records = []
+    tickers = list(states.keys())
+    if len(tickers) == 0:
+        print("No tickers available up to cutoff.")
+        return None
+    for ticker in tqdm(tickers, desc="Tickers"):
+        st = states[ticker]
+        # find news row for ticker@cutoff
+        news_row = None
+        try:
+> Настя:
+
+            news_row = news_lookup.loc[(ticker, cutoff)]
+        except Exception:
+            news_row = None
+        if np.isnan(st['last_close']):
+            # no price history -> zeros
+            r_hats = [0.0]*horizon
+            p_ups = [0.5]*horizon
+        else:
+            # copy state so original mapping not mutated
+            stcopy = {'closes': deque(st['closes'], maxlen=st['closes'].maxlen) if isinstance(st['closes'], deque) else deque(list(st['closes'])),
+                      'rets': deque(st['rets'], maxlen=st['rets'].maxlen) if isinstance(st['rets'], deque) else deque(list(st['rets'])),
+                      'vols': deque(st['vols'], maxlen=st['vols'].maxlen) if isinstance(st['vols'], deque) else deque(list(st['vols'])),
+                      'last_close': st['last_close']}
+            r_hats = []
+            p_ups = []
+            for h in range(horizon):
+                fv = state_to_feature_vector(stcopy, news_row, feature_cols, cfg)
+                fv_scaled = scaler.transform(fv.reshape(1,-1))
+                pred_ret = float(reg.predict(fv_scaled)[0])
+                pred_p = float(clf.predict_proba(fv_scaled)[0,1])
+                r_hats.append(pred_ret)
+                p_ups.append(pred_p)
+                update_state_with_predicted_return(stcopy, pred_ret)
+        rec = {'date_cutoff': cutoff.date().isoformat(), 'ticker': ticker}
+        for i in range(1, horizon+1):
+            rec[f'r_hat_{i}'] = r_hats[i-1]
+        rec[f'R_hat_{horizon}'] = float(sum(r_hats))
+        for i in range(1, horizon+1):
+            rec[f'p_up_{i}'] = p_ups[i-1]
+        rec['model_version'] = 'lgbm_v1_recursive'
+        records.append(rec)
+    out_df = pd.DataFrame(records)
+    out_path = os.path.join(cfg['output']['predictions_dir'], f"predictions_{cutoff.date().isoformat()}_h{horizon}.csv")
+    out_df.to_csv(out_path, index=False, float_format="%.8f")
+    print("Saved recursive predictions to", out_path)
+    return out_path
+
+# ---------------------------
+# Evaluation
+# ---------------------------
+def directional_accuracy(y_true, y_pred):
+    return np.mean(np.sign(y_true) == np.sign(y_pred))
+
+def evaluate(pred_file, truth_file):
+    if not os.path.exists(pred_file):
+        raise FileNotFoundError("Predictions file not found: " + pred_file)
+    if not os.path.exists(truth_file):
+        raise FileNotFoundError("Truth file not found: " + truth_file)
+    preds = pd.read_csv(pred_file)
+    truth = pd.read_csv(truth_file)
+    # Expect truth contains date_cutoff, ticker, ret_next (next-day arithmetic return)
+    merged = preds.merge(truth[['date_cutoff','ticker','ret_next']], on=['date_cutoff','ticker'], how='left')
+    if merged['ret_next'].isna().any():
+        print("Warning: Some truth ret_next missing after merge. Those rows will be treated as 0.")
+    y_true = merged['ret_next'].fillna(0.0).values
+    if 'r_hat_1' in merged.columns:
+        y_pred = merged['r_hat_1'].values
+    else:
+        # if only multihorizon r_hat_1..N exist, take r_hat_1
+        rcols = [c for c in merged.columns if c.startswith('r_hat_')]
+        if len(rcols) == 0:
+            raise ValueError("No r_hat_* columns found in predictions for evaluation.")
+        y_pred = merged[rcols[0]].values
+    mae = mean_absolute_error(y_true, y_pred)
+    brier = brier_score_loss((y_true > 0).astype(int), merged['p_up_1'].fillna(0.5).values)
+    da = directional_accuracy(y_true, y_pred)
+    print(f"MAE: {mae:.8f}")
+    print(f"Brier: {brier:.8f}")
+    print(f"Directional Accuracy: {da:.4f}")
+    return {'mae':mae,'brier':brier,'da':da}
+
+> Настя:
+
+
+# ---------------------------
+# CLI
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="FORECAST MVP single-file pipeline")
+    parser.add_argument("--mode", choices=['train','predict','predict_recursive','evaluate'], required=True)
+    parser.add_argument("--config", default=None, help="path to YAML config (optional)")
+    parser.add_argument("--cutoff", default=None, help="cutoff date YYYY-MM-DD for prediction (optional)")
+    parser.add_argument("--horizon", default=20, type=int, help="horizon for recursive prediction")
+    parser.add_argument("--pred_file", default=None, help="predictions csv for evaluate")
+    parser.add_argument("--truth_file", default=None, help="truth csv for evaluate")
+    args = parser.parse_args()
+    cfg = read_config_from_yaml(args.config)
+    ensure_dirs(cfg['output']['artifacts_dir'], cfg['output']['predictions_dir'])
+    if args.mode == 'train':
+        train_all(cfg)
+    elif args.mode == 'predict':
+        predict(cfg)
+    elif args.mode == 'predict_recursive':
+        predict_recursive(cfg, cutoff_date=args.cutoff, horizon=args.horizon)
+    elif args.mode == 'evaluate':
+        if not args.pred_file or not args.truth_file:
+            print("For evaluate mode you must provide --pred_file and --truth_file")
+            sys.exit(1)
+        evaluate(args.pred_file, args.truth_file)
+    else:
+        print("Unknown mode.")
+
+if __name__ == "__main__":
+    main()
